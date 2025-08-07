@@ -2,6 +2,7 @@ import os
 import json
 import time
 import logging
+import asyncio
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -29,7 +30,9 @@ APPS_SPREADSHEET_ID = os.getenv('APPS_SPREADSHEET_ID')  # ID таблицы с �
 CHATS_SPREADSHEET_ID = os.getenv('CHATS_SPREADSHEET_ID')  # ID таблицы с данными чатов
 APPS_SHEET_NAME = 'Sheet1'  # Имя листа с данными приложений
 CHATS_SHEET_NAME = 'Sheet1'  # Имя листа с данными чатов
-CHECK_INTERVAL = 300  # 20 seconds
+CHECK_INTERVAL = 300  # 5 minutes
+CONFIRMATION_CHECKS = 5  # Количество дополнительных проверок для подтверждения
+CONFIRMATION_INTERVAL = 36  # Интервал между проверками подтверждения (3 минуты / 5 проверок = 36 секунд)
 
 # Emojis
 EMOJI_AVAILABLE = "🟢"
@@ -138,14 +141,82 @@ class AppStoreMonitor:
             logger.error(f"Error loading chats: {e}")
 
     def check_app_availability(self, app_id: str, geo: str) -> bool:
-        """Check if an app is available in the specified region."""
+        """Check if an app is available in the specified region by HTTP status code."""
         url = self.get_app_store_link(app_id, geo)
-        try:
-            response = requests.get(url, timeout=10)
-            return response.status_code != 404
-        except requests.RequestException as e:
-            logger.error(f"Error checking app {app_id} in {geo}: {e}")
-            return False
+        
+        for attempt in range(3): # Changed from RETRY_ATTEMPTS to 3
+            try:
+                # Используем более реалистичные заголовки
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1',
+                }
+                
+                response = requests.get(url, timeout=15, headers=headers, allow_redirects=True)
+                
+                # Простая проверка по статус коду
+                if response.status_code == 404:
+                    logger.info(f"App {app_id} in {geo}: 404 Not Found")
+                    return False
+                elif response.status_code == 200:
+                    logger.info(f"App {app_id} in {geo}: Available (200 OK)")
+                    return True
+                elif response.status_code >= 500:
+                    # Серверная ошибка - повторяем попытку
+                    logger.warning(f"App {app_id} in {geo}: Server error {response.status_code}, attempt {attempt + 1}")
+                    if attempt < 2: # Changed from RETRY_ATTEMPTS - 1 to 2
+                        time.sleep(5) # Changed from RETRY_DELAY to 5
+                        continue
+                    return False
+                else:
+                    logger.warning(f"App {app_id} in {geo}: Unexpected status code {response.status_code}")
+                    # Для неожиданных кодов считаем приложение недоступным
+                    return False
+                    
+            except requests.Timeout:
+                logger.warning(f"Timeout checking app {app_id} in {geo}, attempt {attempt + 1}")
+                if attempt < 2: # Changed from RETRY_ATTEMPTS - 1 to 2
+                    time.sleep(5) # Changed from RETRY_DELAY to 5
+                    continue
+                return False
+            except requests.RequestException as e:
+                logger.error(f"Network error checking app {app_id} in {geo}: {e}, attempt {attempt + 1}")
+                if attempt < 2: # Changed from RETRY_ATTEMPTS - 1 to 2
+                    time.sleep(5) # Changed from RETRY_DELAY to 5
+                    continue
+                return False
+        
+        # Если все попытки исчерпаны, считаем приложение недоступным
+        logger.error(f"All retry attempts failed for app {app_id} in {geo}")
+        return False
+
+    async def confirm_status_change(self, app_id: str, geo: str, expected_status: bool) -> bool:
+        """Confirm status change by performing additional checks over 3 minutes."""
+        logger.info(f"Starting confirmation checks for {app_id} in {geo}, expected status: {expected_status}")
+        
+        confirmed_count = 0
+        
+        for check_num in range(CONFIRMATION_CHECKS):
+            await asyncio.sleep(CONFIRMATION_INTERVAL)
+            
+            current_status = self.check_app_availability(app_id, geo)
+            logger.info(f"Confirmation check {check_num + 1}/{CONFIRMATION_CHECKS} for {app_id} in {geo}: {current_status}")
+            
+            if current_status == expected_status:
+                confirmed_count += 1
+            
+        # Требуем подтверждения в большинстве проверок (минимум 3 из 5)
+        confirmation_threshold = (CONFIRMATION_CHECKS + 1) // 2  # 3 из 5
+        is_confirmed = confirmed_count >= confirmation_threshold
+        
+        logger.info(f"Confirmation result for {app_id} in {geo}: {confirmed_count}/{CONFIRMATION_CHECKS} confirmations, "
+                   f"threshold: {confirmation_threshold}, confirmed: {is_confirmed}")
+        
+        return is_confirmed
 
     def read_sheet_data(self) -> List[Dict]:
         """Read data from Google Sheets."""
@@ -214,8 +285,8 @@ class AppStoreMonitor:
                 if "bot was blocked by the user" in str(e) or "chat not found" in str(e):
                     self.active_chats.remove(chat_id)
 
-    def check_apps(self):
-        """Main function to check all apps."""
+    async def check_apps(self):
+        """Main function to check all apps with confirmation mechanism."""
         logger.info("Starting apps check...")
         
         apps_data = self.read_sheet_data()
@@ -226,49 +297,96 @@ class AppStoreMonitor:
             geos = app_data['geos']
 
             # Проверяем доступность во всех регионах
+            new_status_by_geo = {}
             is_available_in_any = False
-            status_changed = False
-            status_changes = []
             available_links = []
+            status_changes = []
 
             for geo in geos:
                 is_available = self.check_app_availability(app_id, geo)
+                new_status_by_geo[geo] = is_available
                 logger.info(f"App {app_id} in {geo} is {'available' if is_available else 'unavailable'}")
                 
                 if is_available:
                     is_available_in_any = True
                     available_links.append(f"<a href='{self.get_app_store_link(app_id, geo)}'>{geo}</a>")
                 
-                # Если статус изменился для этого региона
+                # Проверяем, изменился ли статус для этого региона
                 if is_available != current_status:
-                    status_changes.append(f"{geo}: {'доступен' if is_available else 'недоступен'}")
-                    status_changed = True
+                    status_changes.append({
+                        'geo': geo,
+                        'old_status': current_status,
+                        'new_status': is_available
+                    })
 
-            # Если общий статус изменился или изменился статус в каком-то регионе
-            if is_available_in_any != current_status or status_changed:
-                logger.info(f"Status changed for app {app_id}")
-                self.update_sheet(row_index, is_available_in_any)
+            # Если есть изменения статуса, запускаем процедуру подтверждения
+            if status_changes:
+                logger.info(f"Status changes detected for app {app_id}, starting confirmation process...")
                 
-                # Формируем сообщение
-                emoji = EMOJI_AVAILABLE if is_available_in_any else EMOJI_UNAVAILABLE
-                if status_changes:
+                confirmed_changes = []
+                
+                # Запускаем подтверждающие проверки для каждого региона с изменением
+                for change in status_changes:
+                    geo = change['geo']
+                    expected_status = change['new_status']
+                    
+                    logger.info(f"Confirming status change for {app_id} in {geo}: {change['old_status']} -> {expected_status}")
+                    
+                    # Выполняем 5 дополнительных проверок за 3 минуты
+                    is_confirmed = await self.confirm_status_change(app_id, geo, expected_status)
+                    
+                    if is_confirmed:
+                        confirmed_changes.append(change)
+                        logger.info(f"Status change confirmed for {app_id} in {geo}")
+                    else:
+                        logger.info(f"Status change NOT confirmed for {app_id} in {geo}")
+
+                # Если есть подтвержденные изменения, отправляем уведомление
+                if confirmed_changes:
+                    # Пересчитываем финальный статус с учетом подтвержденных изменений
+                    final_available_geos = []
+                    for geo in geos:
+                        # Проверяем, было ли подтверждено изменение для этого региона
+                        confirmed_change = next((c for c in confirmed_changes if c['geo'] == geo), None)
+                        if confirmed_change:
+                            # Используем подтвержденный статус
+                            if confirmed_change['new_status']:
+                                final_available_geos.append(geo)
+                        else:
+                            # Используем текущий статус из таблицы
+                            if current_status:
+                                final_available_geos.append(geo)
+                    
+                    final_status = len(final_available_geos) > 0
+                    
+                    # Обновляем таблицу
+                    self.update_sheet(row_index, final_status)
+                    
+                    # Формируем сообщение
+                    emoji = EMOJI_AVAILABLE if final_status else EMOJI_UNAVAILABLE
+                    
+                    status_change_text = []
+                    for change in confirmed_changes:
+                        old_text = 'доступен' if change['old_status'] else 'недоступен'
+                        new_text = 'доступен' if change['new_status'] else 'недоступен'
+                        status_change_text.append(f"{change['geo']}: {old_text} → {new_text}")
+                    
                     message = (
                         f"{emoji} <b>{app_name}</b> (ID: {app_id})\n"
-                        f"Статус: {'доступен' if is_available_in_any else 'недоступен'}\n"
-                        f"Изменения по регионам:\n" + 
-                        "\n".join(status_changes)
+                        f"Подтвержденные изменения статуса:\n" + 
+                        "\n".join(status_change_text)
                     )
+                    
+                    # Обновляем ссылки на доступные регионы
+                    final_available_links = [f"<a href='{self.get_app_store_link(app_id, geo)}'>{geo}</a>" 
+                                           for geo in final_available_geos]
+                    
+                    if final_available_links:
+                        message += "\n\nДоступен в регионах:\n" + "\n".join(final_available_links)
+                    
+                    await self.send_telegram_message(message)
                 else:
-                    message = (
-                        f"{emoji} <b>{app_name}</b> (ID: {app_id})\n"
-                        f"Статус: {'доступен' if is_available_in_any else 'недоступен'}"
-                    )
-                
-                # Добавляем ссылки на доступные регионы
-                if available_links:
-                    message += "\n\nДоступен в регионах:\n" + "\n".join(available_links)
-                
-                asyncio.create_task(self.send_telegram_message(message))
+                    logger.info(f"No status changes confirmed for app {app_id}, skipping notification")
 
     async def run(self):
         """Main loop to run the monitor."""
@@ -290,13 +408,12 @@ class AppStoreMonitor:
         logger.info("Starting App Store Monitor...")
         while True:
             try:
-                self.check_apps()
+                await self.check_apps()
                 await asyncio.sleep(CHECK_INTERVAL)
             except Exception as e:
                 logger.error(f"Error in main loop: {e}")
                 await asyncio.sleep(60)  # Wait a minute before retrying on error
 
 if __name__ == '__main__':
-    import asyncio
     monitor = AppStoreMonitor()
     asyncio.run(monitor.run()) 
