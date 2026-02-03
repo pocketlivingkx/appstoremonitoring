@@ -290,7 +290,8 @@ class AppStoreMonitor:
             logger.warning("Telegram bot not configured")
             return
 
-        for chat_id in self.active_chats:
+        chats_to_remove = []
+        for chat_id in list(self.active_chats):  # Итерируем по копии
             try:
                 await self.bot.send_message(
                     chat_id=chat_id,
@@ -299,9 +300,13 @@ class AppStoreMonitor:
                 )
             except Exception as e:
                 logger.error(f"Error sending message to chat {chat_id}: {e}")
-                # Remove chat from active chats if bot was removed
-                if "bot was blocked by the user" in str(e) or "chat not found" in str(e):
-                    self.active_chats.remove(chat_id)
+                # Mark chat for removal if bot was removed
+                if "bot was blocked by the user" in str(e).lower() or "chat not found" in str(e).lower():
+                    chats_to_remove.append(chat_id)
+        
+        # Remove chats after iteration
+        for chat_id in chats_to_remove:
+            self.active_chats.discard(chat_id)
 
     async def send_discord_message(self, message: str, custom_fields: Dict = None):
         """Send message to Discord via webhook."""
