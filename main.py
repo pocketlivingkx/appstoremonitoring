@@ -34,6 +34,9 @@ CHECK_INTERVAL = 300  # 5 minutes
 CONFIRMATION_CHECKS = 5  # Количество дополнительных проверок для подтверждения
 CONFIRMATION_INTERVAL = 36  # Интервал между проверками подтверждения (3 минуты / 5 проверок = 36 секунд)
 
+# Discord webhook
+DISCORD_WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL')
+
 # Emojis
 EMOJI_AVAILABLE = "🟢"
 EMOJI_UNAVAILABLE = "🔴"
@@ -219,11 +222,12 @@ class AppStoreMonitor:
         return is_confirmed
 
     def read_sheet_data(self) -> List[Dict]:
-        """Read data from Google Sheets."""
+        """Read data from Google Sheets including custom fields from columns F onwards."""
         try:
+            # Read all columns (A:Z to capture any custom fields)
             result = self.sheet.values().get(
                 spreadsheetId=APPS_SPREADSHEET_ID,
-                range=self.get_range(APPS_SHEET_NAME, 'A:E')  # Добавлена колонка с названием
+                range=self.get_range(APPS_SHEET_NAME, 'A:Z')
             ).execute()
             
             values = result.get('values', [])
@@ -231,17 +235,31 @@ class AppStoreMonitor:
                 logger.warning('No data found in sheet')
                 return []
 
-            # Skip header row
-            return [
-                {
-                    'app_id': row[0],
-                    'app_name': row[1] if len(row) > 1 else "Unknown App",  # Название приложения
+            # Get headers from first row (for custom fields)
+            headers = values[0] if values else []
+            
+            apps = []
+            for row in values[1:]:  # Skip header row
+                app_data = {
+                    'app_id': row[0] if len(row) > 0 else '',
+                    'app_name': row[1] if len(row) > 1 else "Unknown App",
                     'is_available': row[2].lower() == 'true' if len(row) > 2 else False,
                     'last_update': row[3] if len(row) > 3 else None,
-                    'geos': [geo.strip() for geo in row[4].split(',')] if len(row) > 4 else []
+                    'geos': [geo.strip() for geo in row[4].split(',')] if len(row) > 4 else [],
+                    'custom_fields': {}
                 }
-                for row in values[1:]
-            ]
+                
+                # Read custom fields from columns F onwards (index 5+)
+                for col_index in range(5, len(row)):
+                    if col_index < len(headers) and row[col_index]:
+                        field_name = headers[col_index]
+                        field_value = row[col_index]
+                        if field_name and field_value:
+                            app_data['custom_fields'][field_name] = field_value
+                
+                apps.append(app_data)
+            
+            return apps
         except HttpError as e:
             logger.error(f"Google Sheets API error while reading sheet: {e}")
             return []
@@ -285,6 +303,42 @@ class AppStoreMonitor:
                 if "bot was blocked by the user" in str(e) or "chat not found" in str(e):
                     self.active_chats.remove(chat_id)
 
+    async def send_discord_message(self, message: str, custom_fields: Dict = None):
+        """Send message to Discord via webhook."""
+        if not DISCORD_WEBHOOK_URL:
+            logger.warning("Discord webhook URL not configured")
+            return
+        
+        try:
+            # Convert HTML links to Discord markdown format
+            import re
+            # Replace <a href='URL'>TEXT</a> with [TEXT](URL)
+            discord_message = re.sub(
+                r"<a href='([^']+)'>([^<]+)</a>",
+                r"[\2](\1)",
+                message
+            )
+            # Replace <b>TEXT</b> with **TEXT**
+            discord_message = re.sub(r"<b>([^<]+)</b>", r"**\1**", discord_message)
+            
+            payload = {
+                "content": discord_message
+            }
+            
+            response = requests.post(
+                DISCORD_WEBHOOK_URL,
+                json=payload,
+                timeout=10
+            )
+            
+            if response.status_code not in [200, 204]:
+                logger.error(f"Discord webhook error: {response.status_code} - {response.text}")
+            else:
+                logger.info("Discord message sent successfully")
+                
+        except Exception as e:
+            logger.error(f"Error sending Discord message: {e}")
+
     async def check_apps(self):
         """Main function to check all apps with confirmation mechanism."""
         logger.info("Starting apps check...")
@@ -295,6 +349,7 @@ class AppStoreMonitor:
             app_name = app_data['app_name']
             current_status = app_data['is_available']
             geos = app_data['geos']
+            custom_fields = app_data.get('custom_fields', {})
 
             # Проверяем доступность во всех регионах
             new_status_by_geo = {}
@@ -384,7 +439,15 @@ class AppStoreMonitor:
                     if final_available_links:
                         message += "\n\nДоступен в регионах:\n" + "\n".join(final_available_links)
                     
+                    # Добавляем кастомные поля, если они есть
+                    if custom_fields:
+                        message += "\n"
+                        for field_name, field_value in custom_fields.items():
+                            message += f"\n{field_name}: {field_value}"
+                    
+                    # Отправляем в Telegram и Discord
                     await self.send_telegram_message(message)
+                    await self.send_discord_message(message, custom_fields)
                 else:
                     logger.info(f"No status changes confirmed for app {app_id}, skipping notification")
 
