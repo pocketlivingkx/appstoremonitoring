@@ -308,41 +308,67 @@ class AppStoreMonitor:
         for chat_id in chats_to_remove:
             self.active_chats.discard(chat_id)
 
-    async def send_discord_message(self, message: str, custom_fields: Dict = None):
-        """Send message to Discord via webhook."""
+    async def send_discord_message(self, message: str, custom_fields: Dict = None, max_retries: int = 5):
+        """Send message to Discord via webhook with retry on rate limit."""
         if not DISCORD_WEBHOOK_URL:
             logger.warning("Discord webhook URL not configured")
             return
         
-        try:
-            # Convert HTML links to Discord markdown format
-            import re
-            # Replace <a href='URL'>TEXT</a> with [TEXT](URL)
-            discord_message = re.sub(
-                r"<a href='([^']+)'>([^<]+)</a>",
-                r"[\2](\1)",
-                message
-            )
-            # Replace <b>TEXT</b> with **TEXT**
-            discord_message = re.sub(r"<b>([^<]+)</b>", r"**\1**", discord_message)
-            
-            payload = {
-                "content": discord_message
-            }
-            
-            response = requests.post(
-                DISCORD_WEBHOOK_URL,
-                json=payload,
-                timeout=10
-            )
-            
-            if response.status_code not in [200, 204]:
-                logger.error(f"Discord webhook error: {response.status_code} - {response.text}")
-            else:
-                logger.info("Discord message sent successfully")
+        import re
+        
+        # Convert HTML links to Discord markdown format
+        # Replace <a href='URL'>TEXT</a> with [TEXT](URL)
+        discord_message = re.sub(
+            r"<a href='([^']+)'>([^<]+)</a>",
+            r"[\2](\1)",
+            message
+        )
+        # Replace <b>TEXT</b> with **TEXT**
+        discord_message = re.sub(r"<b>([^<]+)</b>", r"**\1**", discord_message)
+        
+        payload = {
+            "content": discord_message
+        }
+        
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(
+                    DISCORD_WEBHOOK_URL,
+                    json=payload,
+                    timeout=10
+                )
                 
-        except Exception as e:
-            logger.error(f"Error sending Discord message: {e}")
+                if response.status_code in [200, 204]:
+                    logger.info("Discord message sent successfully")
+                    return
+                elif response.status_code == 429:
+                    # Rate limited - get retry delay from response
+                    retry_after = 60  # Default 60 seconds
+                    try:
+                        data = response.json()
+                        retry_after = data.get('retry_after', 60)
+                        # Also check Retry-After header
+                        if 'Retry-After' in response.headers:
+                            retry_after = max(retry_after, float(response.headers['Retry-After']))
+                    except:
+                        pass
+                    
+                    # Cap at 5 minutes max wait
+                    retry_after = min(retry_after, 300)
+                    
+                    logger.warning(f"Discord rate limited (attempt {attempt + 1}/{max_retries}), "
+                                   f"retry_after={retry_after}s, headers={dict(response.headers)}, body={response.text}")
+                    await asyncio.sleep(retry_after)
+                else:
+                    logger.error(f"Discord webhook error: {response.status_code} - {response.text}")
+                    return  # Don't retry on other errors
+                    
+            except Exception as e:
+                logger.error(f"Error sending Discord message: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(5)  # Brief wait before retry on network errors
+                    
+        logger.error("Discord message failed after all retries")
 
     async def check_apps(self):
         """Main function to check all apps with confirmation mechanism."""
