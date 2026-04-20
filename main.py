@@ -87,46 +87,23 @@ class AppStoreMonitor:
         return f'https://apps.apple.com/{geo}/app/{app_id}'
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle the /start command."""
+        """Handle the /start command. Only authorized chats (listed in the chats sheet) receive notifications."""
         chat_id = update.effective_chat.id
-        chat_title = update.effective_chat.title or str(chat_id)
-        
-        # Add chat to active chats
-        self.active_chats.add(chat_id)
-        
-        # Save chat to Google Sheets
-        await self.save_chat(chat_id, chat_title)
-        
-        await update.message.reply_text(
-            f"Привет! Я бот для мониторинга доступности приложений в App Store.\n"
-            f"Теперь я буду отправлять уведомления об изменениях в этом чате."
-        )
 
-    async def save_chat(self, chat_id: int, chat_title: str):
-        """Save chat ID and title to Google Sheets."""
-        try:
-            # Check if chat already exists
-            result = self.sheet.values().get(
-                spreadsheetId=CHATS_SPREADSHEET_ID,
-                range=self.get_range(CHATS_SHEET_NAME, 'A:B')
-            ).execute()
-            
-            values = result.get('values', [])
-            chat_exists = any(str(chat_id) == row[0] for row in values)
-            
-            if not chat_exists:
-                # Add new chat
-                values = [[str(chat_id), chat_title]]
-                self.sheet.values().append(
-                    spreadsheetId=CHATS_SPREADSHEET_ID,
-                    range=self.get_range(CHATS_SHEET_NAME, 'A:B'),
-                    valueInputOption='RAW',
-                    body={'values': values}
-                ).execute()
-        except HttpError as e:
-            logger.error(f"Google Sheets API error while saving chat: {e}")
-        except Exception as e:
-            logger.error(f"Error saving chat: {e}")
+        # Refresh the authorized-chats whitelist from the sheet so manual additions take effect without restart
+        self.load_active_chats()
+
+        if chat_id not in self.active_chats:
+            logger.info(f"Unauthorized /start from chat {chat_id} ({update.effective_chat.title!r})")
+            await update.message.reply_text(
+                f"Этот чат не авторизован для мониторинга.\n"
+                f"Chat ID: {chat_id}"
+            )
+            return
+
+        await update.message.reply_text(
+            "Чат авторизован. Уведомления об изменениях будут приходить сюда."
+        )
 
     def load_active_chats(self):
         """Load active chats from Google Sheets."""
@@ -373,7 +350,10 @@ class AppStoreMonitor:
     async def check_apps(self):
         """Main function to check all apps with confirmation mechanism."""
         logger.info("Starting apps check...")
-        
+
+        # Refresh authorized chats on every cycle so manual edits to the sheet take effect without a restart
+        self.load_active_chats()
+
         apps_data = self.read_sheet_data()
         for row_index, app_data in enumerate(apps_data, start=2):  # start=2 because of header row
             app_id = app_data['app_id']
